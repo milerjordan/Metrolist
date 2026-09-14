@@ -11,6 +11,9 @@ import android.net.NetworkCapabilities
 import androidx.datastore.preferences.core.Preferences
 import androidx.media3.common.MediaItem
 import com.metrolist.innertube.YouTube
+import com.metrolist.innertube.YouTube.SearchFilter
+import com.metrolist.innertube.models.SongItem
+import com.metrolist.lastfm.LastFM
 import com.metrolist.innertube.models.WatchEndpoint
 import com.metrolist.music.constants.FlowNeuroAllowAlternativesKey
 import com.metrolist.music.constants.FlowNeuroArtistDiversityKey
@@ -81,7 +84,8 @@ class FlowNeuroEngine(
             database.relatedSongs(current.id).map { it.toMediaMetadata() }
         }
         val online = if (shouldUseOnline(prefs)) fetchOnline(current.id) else emptyList()
-        val candidates = (local + online).distinctBy { it.id }
+        val lastFm = fetchLastFmCandidates(current)
+        val candidates = (local + online + lastFm).distinctBy { it.id }
         val excludeQueue = prefs[FlowNeuroExcludeQueueKey] ?: true
         val minimum = similarityThreshold(prefs[FlowNeuroSimilarityKey] ?: "90%")
         val whitelistEnabled = prefs[FlowNeuroWhitelistEnabledKey] ?: false
@@ -101,6 +105,8 @@ class FlowNeuroEngine(
         val timeAffinities = decodeScores(prefs[FlowNeuroTimeAffinitiesKey])
         val timeAffinity = timeAffinities[timeBucket()] ?: 0.0
         val selectedArtists = mutableSetOf<String>()
+        val selectedAlbums = mutableSetOf<String>()
+        val currentAlbum = current.album?.title?.let(::normalize)
 
         val ranked = candidates.asSequence()
             .filter { it.id != current.id && (!excludeQueue || it.id !in queuedIds) }
@@ -108,7 +114,8 @@ class FlowNeuroEngine(
             .filter { candidate ->
                 val artists = candidate.artists.map { normalize(it.name) }.filter(String::isNotBlank)
                 val album = candidate.album?.title?.let(::normalize)
-                artists.none { it in recentArtists } && (album == null || album !in recentAlbums)
+                artists.none { it in recentArtists } &&
+                    (album == null || (album !in recentAlbums && album != currentAlbum && album !in selectedAlbums))
             }
             .filter { !whitelistEnabled || it.artists.any { artist -> normalize(artist.name) in whitelist } }
             .filter { allowAlternatives || !isAlternative(it.title) }
@@ -132,7 +139,11 @@ class FlowNeuroEngine(
                     "Equilibrada" -> artist in selectedArtists
                     else -> false
                 }
-                if (blockedByDiversity) null else candidate.also { selectedArtists += artist }
+                val album = candidate.album?.title?.let(::normalize)
+                if (blockedByDiversity || (album != null && album in selectedAlbums)) null else candidate.also {
+                    selectedArtists += artist
+                    album?.let(selectedAlbums::add)
+                }
             }
             // Fill a real discovery block instead of behaving like YouTube Music's
             // single safe recommendation. Diversity and the persistent rotation
@@ -148,6 +159,23 @@ class FlowNeuroEngine(
             local.size,
             if (prefs[FlowNeuroContinuityEnabledKey] ?: true) prefs[FlowNeuroContinuityKey] ?: "FlowNeuro dominante" else "FlowNeuro dominante",
         )
+    }
+
+    private suspend fun fetchLastFmCandidates(current: MediaMetadata): List<MediaMetadata> = withContext(Dispatchers.IO) {
+        if (!LastFM.hasPublicApiKey()) return@withContext emptyList()
+        val artist = current.artists.firstOrNull()?.name ?: return@withContext emptyList()
+        val resolved = mutableListOf<MediaMetadata>()
+        for (candidate in LastFM.similarTracks(artist, current.title, limit = 24).getOrDefault(emptyList()).take(12)) {
+                val songs = YouTube.search("${candidate.artist} ${candidate.track}", SearchFilter.FILTER_SONG)
+                    .getOrNull()?.items?.filterIsInstance<SongItem>().orEmpty()
+                songs.firstOrNull { song ->
+                    val artistMatches = song.artists.any { normalize(it.name) == normalize(candidate.artist) }
+                    val titleMatches = normalize(song.title).contains(normalize(candidate.track)) ||
+                        normalize(candidate.track).contains(normalize(song.title))
+                    artistMatches && titleMatches && !isAlternative(song.title)
+                }?.toMediaMetadata()?.takeIf { it.duration > 0 }?.let(resolved::add)
+        }
+        resolved
     }
 
     suspend fun requiredCompletionRatio(): Float =

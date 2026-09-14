@@ -274,6 +274,7 @@ class MusicService :
     private var flowNeuroJob: Job? = null
     private var flowNeuroRequestId = 0L
     private val flowNeuroInjectedIds = mutableSetOf<String>()
+    private var flowNeuroPreparedFor: String? = null
     private var flowNeuroObservedMediaId: String? = null
     private var flowNeuroObservedPositionMs: Long = 0L
     private var flowNeuroObservedDurationMs: Long = 1L
@@ -2509,23 +2510,18 @@ class MusicService :
         flowNeuroJob = scope.launch(SilentHandler) {
             delay(250)
             val current = player.currentMetadata ?: return@launch
-            val requiredRatio = runCatching { flowNeuroEngine.requiredCompletionRatio() }.getOrDefault(0f)
-            while (requiredRatio > 0f && requestId == flowNeuroRequestId &&
+            val durationMs = player.duration.takeIf { it > 0 && it != C.TIME_UNSET }
+                ?: (current.duration * 1000L).takeIf { it > 0 } ?: return@launch
+            // Prefetch before the confirmation point so network resolution cannot
+            // leave the player without a next item. The actual insertion remains
+            // gated at 80% of the current song.
+            while (requestId == flowNeuroRequestId &&
                 player.currentMetadata?.id == current.id && player.playbackState != STATE_IDLE
             ) {
-                val durationMs = player.duration.takeIf { it > 0 && it != C.TIME_UNSET }
-                    ?: (current.duration * 1000L).takeIf { it > 0 }
-                if (durationMs == null || player.currentPosition.toDouble() / durationMs >= requiredRatio) break
+                if (player.currentPosition.toDouble() / durationMs >= 0.65) break
                 delay(500)
             }
             if (requestId != flowNeuroRequestId || player.currentMetadata?.id != current.id) return@launch
-            val currentIndex = player.currentMediaItemIndex
-            if (currentIndex < 0 || currentIndex >= player.mediaItemCount) return@launch
-            // Keep the original YouTube Music queue intact. FlowNeuro does not use
-            // it as a recommendation source; it only inserts its next FLOW item
-            // immediately after the current item, ahead of the untouched queue.
-            // Se pasan todos los IDs como conjunto de exclusión. FlowNeuro no
-            // usa estos elementos como fuente ni elimina la cola original.
             val queuedIds = (0 until player.mediaItemCount)
                 .map { index -> player.getMediaItemAt(index).mediaId }
                 .toSet() + flowNeuroInjectedIds
@@ -2533,26 +2529,37 @@ class MusicService :
                 flowNeuroEngine.recommend(current, queuedIds)
             }
             if (requestId != flowNeuroRequestId || player.currentMetadata?.id != current.id) return@launch
-            if (result.items.isEmpty() || player.playbackState == STATE_IDLE) return@launch
-            val latestIds = (0 until player.mediaItemCount)
-                .map { index -> player.getMediaItemAt(index).mediaId }
-                .toSet()
-            val newItems = result.items.filter { it.mediaId !in latestIds && it.mediaId !in flowNeuroInjectedIds }
-            if (newItems.isEmpty()) return@launch
-            val insertIndex = (player.currentMediaItemIndex + 1).coerceAtMost(player.mediaItemCount)
-            player.addMediaItems(insertIndex, newItems)
-            flowNeuroInjectedIds += newItems.map { it.mediaId }
-            newItems.forEach { item ->
-                scope.launch(Dispatchers.IO + SilentHandler) {
-                    val metadata = item.metadata
-                    flowNeuroEngine.recordInjected(
-                        item.mediaId,
-                        metadata?.artists?.map { it.name }.orEmpty(),
-                        metadata?.album?.title,
-                    )
-                }
+            val item = result.items.firstOrNull { it.mediaId !in flowNeuroInjectedIds }
+                ?: return@launch
+            flowNeuroPreparedFor = current.id
+            while (requestId == flowNeuroRequestId && player.currentMetadata?.id == current.id &&
+                player.playbackState != STATE_IDLE
+            ) {
+                if (player.currentPosition.toDouble() / durationMs >= 0.80) break
+                delay(250)
             }
-            Timber.tag("FlowNeuro").d("Injected %d/%d candidates after %s", newItems.size, result.candidateCount, current.id)
+            if (requestId != flowNeuroRequestId || player.currentMetadata?.id != current.id ||
+                player.playbackState == STATE_IDLE || flowNeuroPreparedFor != current.id
+            ) return@launch
+            val currentIndex = player.currentMediaItemIndex
+            if (currentIndex < 0 || currentIndex >= player.mediaItemCount) return@launch
+            // Aggressive mode owns the queue: once a validated FLOW item exists,
+            // remove every pending YouTube Music/manual item before inserting it.
+            if (player.mediaItemCount > currentIndex + 1) {
+                player.removeMediaItems(currentIndex + 1, player.mediaItemCount)
+            }
+            player.addMediaItem(currentIndex + 1, item)
+            flowNeuroInjectedIds += item.mediaId
+            flowNeuroPreparedFor = null
+            scope.launch(Dispatchers.IO + SilentHandler) {
+                val metadata = item.metadata
+                flowNeuroEngine.recordInjected(
+                    item.mediaId,
+                    metadata?.artists?.map { it.name }.orEmpty(),
+                    metadata?.album?.title,
+                )
+            }
+            Timber.tag("FlowNeuro").d("Injected one validated candidate from %d candidates after %s", result.candidateCount, current.id)
         }
     }
 

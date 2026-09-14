@@ -14,6 +14,10 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.security.MessageDigest
 
 object LastFM {
@@ -192,6 +196,30 @@ object LastFM {
     }
 
     fun isInitialized(): Boolean = API_KEY.isNotEmpty() && SECRET.isNotEmpty()
+    fun hasPublicApiKey(): Boolean = API_KEY.isNotEmpty()
+
+    /** Public recommendations used by FlowNeuro; authentication is not required. */
+    suspend fun similarTracks(artist: String, track: String, limit: Int = 30): Result<List<SimilarTrack>> = runCatching {
+        if (API_KEY.isBlank()) return@runCatching emptyList()
+        val response = client.get {
+            parameter("method", "track.getsimilar")
+            parameter("api_key", API_KEY)
+            parameter("artist", artist)
+            parameter("track", track)
+            parameter("limit", limit.coerceIn(1, 50))
+            parameter("autocorrect", 1)
+            parameter("format", "json")
+        }.body<JsonObject>()
+        response["similartracks"]?.jsonObject?.get("track")?.jsonArray.orEmpty().mapNotNull { item ->
+            val value = item.jsonObject
+            val name = value["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            val artistName = value["artist"]?.jsonObject?.get("name")?.jsonPrimitive?.content
+                ?: return@mapNotNull null
+            SimilarTrack(artistName, name, value["match"]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0f)
+        }
+    }
+
+    data class SimilarTrack(val artist: String, val track: String, val match: Float)
 
     const val DEFAULT_SCROBBLE_DELAY_PERCENT = 0.5f
     const val DEFAULT_SCROBBLE_MIN_SONG_DURATION = 30
