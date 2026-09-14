@@ -114,7 +114,10 @@ class FlowNeuroEngine(
             .filter { candidate ->
                 val artists = candidate.artists.map { normalize(it.name) }.filter(String::isNotBlank)
                 val album = candidate.album?.title?.let(::normalize)
-                artists.none { it in recentArtists } &&
+                // Recent artists are a diversity preference, not a hard stop:
+                // making them fatal can exhaust the candidate pool after the
+                // first FLOW injection. Song IDs and albums remain hard stops.
+                (artists.none { it in recentArtists } || artists.any { it in current.artists.map { artist -> normalize(artist.name) } }) &&
                     (album == null || (album !in recentAlbums && album != currentAlbum && album !in selectedAlbums))
             }
             .filter { !whitelistEnabled || it.artists.any { artist -> normalize(artist.name) in whitelist } }
