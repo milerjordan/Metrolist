@@ -112,6 +112,21 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        // FlowNeuro local recommendation engine
+        Material3SettingsGroup(
+            title = "Recomendaciones",
+            items = listOf(
+                Material3SettingsItem(
+                    icon = painterResource(R.drawable.graphic_eq),
+                    title = { Text("FlowNeuro") },
+                    description = { Text("Aprendizaje local y continuidad inteligente de cola") },
+                    onClick = { navController.navigate("settings/flowneuro") { launchSingleTop = true } },
+                ),
+            ),
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
         // Android Auto Section — only shown if Android Auto is installed
         if (hasAndroidAuto) {
             Material3SettingsGroup(

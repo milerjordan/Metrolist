@@ -189,6 +189,7 @@ import com.metrolist.music.extensions.toEnum
 import com.metrolist.music.extensions.toMediaItem
 import com.metrolist.music.extensions.toPersistQueue
 import com.metrolist.music.extensions.toQueue
+import com.metrolist.music.flowneuro.FlowNeuroEngine
 import com.metrolist.music.lyrics.LyricsHelper
 import com.metrolist.music.models.PersistPlayerState
 import com.metrolist.music.models.PersistQueue
@@ -268,6 +269,16 @@ class MusicService :
     PlaybackStatsListener.Callback {
     @Inject
     lateinit var database: MusicDatabase
+
+    private lateinit var flowNeuroEngine: FlowNeuroEngine
+    private var flowNeuroJob: Job? = null
+    private var flowNeuroRequestId = 0L
+    private val flowNeuroInjectedIds = mutableSetOf<String>()
+    private var flowNeuroObservedMediaId: String? = null
+    private var flowNeuroObservedPositionMs: Long = 0L
+    private var flowNeuroObservedDurationMs: Long = 1L
+    private var flowNeuroObservedArtists: List<String> = emptyList()
+    private var flowNeuroObservedAlbum: String? = null
 
     @Inject
     lateinit var lyricsHelper: LyricsHelper
@@ -625,6 +636,7 @@ class MusicService :
         // never calls dataStore.get() (which does runBlocking internally).
         // This consolidates ~15 main-thread-blocking DataStore reads into 1.
         startupPrefs = runBlocking(Dispatchers.IO) { dataStore.data.first() }
+        flowNeuroEngine = FlowNeuroEngine(this, database)
 
         // 3. Connect the processor to the service
         // handled in createExoPlayer
@@ -1762,6 +1774,7 @@ class MusicService :
         }
 
         currentQueue = queue
+        flowNeuroInjectedIds.clear()
         queueTitle = null
         val persistShuffleAcrossQueues = dataStore.get(PersistentShuffleAcrossQueuesKey, false)
         if (!persistShuffleAcrossQueues && !restoringQueue) {
@@ -2489,6 +2502,60 @@ class MusicService :
         }
     }
 
+    private fun scheduleFlowNeuroInjection() {
+        if (!::flowNeuroEngine.isInitialized || !playerInitialized.value) return
+        flowNeuroJob?.cancel()
+        val requestId = ++flowNeuroRequestId
+        flowNeuroJob = scope.launch(SilentHandler) {
+            delay(250)
+            val current = player.currentMetadata ?: return@launch
+            val requiredRatio = runCatching { flowNeuroEngine.requiredCompletionRatio() }.getOrDefault(0f)
+            while (requiredRatio > 0f && requestId == flowNeuroRequestId &&
+                player.currentMetadata?.id == current.id && player.playbackState != STATE_IDLE
+            ) {
+                val durationMs = player.duration.takeIf { it > 0 && it != C.TIME_UNSET }
+                    ?: (current.duration * 1000L).takeIf { it > 0 }
+                if (durationMs == null || player.currentPosition.toDouble() / durationMs >= requiredRatio) break
+                delay(500)
+            }
+            if (requestId != flowNeuroRequestId || player.currentMetadata?.id != current.id) return@launch
+            val currentIndex = player.currentMediaItemIndex
+            if (currentIndex < 0 || currentIndex >= player.mediaItemCount) return@launch
+            // Keep the original YouTube Music queue intact. FlowNeuro does not use
+            // it as a recommendation source; it only inserts its next FLOW item
+            // immediately after the current item, ahead of the untouched queue.
+            // Se pasan todos los IDs como conjunto de exclusión. FlowNeuro no
+            // usa estos elementos como fuente ni elimina la cola original.
+            val queuedIds = (0 until player.mediaItemCount)
+                .map { index -> player.getMediaItemAt(index).mediaId }
+                .toSet() + flowNeuroInjectedIds
+            val result = withContext(Dispatchers.IO) {
+                flowNeuroEngine.recommend(current, queuedIds)
+            }
+            if (requestId != flowNeuroRequestId || player.currentMetadata?.id != current.id) return@launch
+            if (result.items.isEmpty() || player.playbackState == STATE_IDLE) return@launch
+            val latestIds = (0 until player.mediaItemCount)
+                .map { index -> player.getMediaItemAt(index).mediaId }
+                .toSet()
+            val newItems = result.items.filter { it.mediaId !in latestIds && it.mediaId !in flowNeuroInjectedIds }
+            if (newItems.isEmpty()) return@launch
+            val insertIndex = (player.currentMediaItemIndex + 1).coerceAtMost(player.mediaItemCount)
+            player.addMediaItems(insertIndex, newItems)
+            flowNeuroInjectedIds += newItems.map { it.mediaId }
+            newItems.forEach { item ->
+                scope.launch(Dispatchers.IO + SilentHandler) {
+                    val metadata = item.metadata
+                    flowNeuroEngine.recordInjected(
+                        item.mediaId,
+                        metadata?.artists?.map { it.name }.orEmpty(),
+                        metadata?.album?.title,
+                    )
+                }
+            }
+            Timber.tag("FlowNeuro").d("Injected %d/%d candidates after %s", newItems.size, result.candidateCount, current.id)
+        }
+    }
+
     override fun onMediaItemTransition(
         mediaItem: MediaItem?,
         reason: Int,
@@ -2496,10 +2563,28 @@ class MusicService :
         // Only natural completion transitions mark the previous track as fully cached,
         // never a manual skip or seek. Read lastTransitionedMediaId before replacing it.
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
-            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
+            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT ||
+            reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
         ) {
             lastTransitionedMediaId?.let { previousId ->
                 scope.launch(Dispatchers.IO) { markCachedIfFullyDownloaded(previousId) }
+                if (previousId in flowNeuroInjectedIds) {
+                    val duration = flowNeuroObservedDurationMs.coerceAtLeast(1L)
+                    val completionRatio = if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                        1f
+                    } else {
+                        (flowNeuroObservedPositionMs.toFloat() / duration).coerceIn(0f, 1f)
+                    }
+                    scope.launch(Dispatchers.IO + SilentHandler) {
+                        flowNeuroEngine.recordPlaybackSignal(
+                            previousId,
+                            completionRatio,
+                            manuallySkipped = reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
+                            artists = flowNeuroObservedArtists,
+                            album = flowNeuroObservedAlbum,
+                        )
+                    }
+                }
             }
         }
         lastTransitionedMediaId = mediaItem?.mediaId
@@ -2537,6 +2622,10 @@ class MusicService :
             }
         }
         previousMediaItemIndex = player.currentMediaItemIndex
+
+        if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
+            scheduleFlowNeuroInjection()
+        }
 
         lastPlaybackSpeed = -1.0f // force update song
 
@@ -2759,6 +2848,25 @@ class MusicService :
         }
         if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
             currentMediaMetadata.value = player.currentMetadata
+        }
+
+        player.currentMediaItem?.mediaId?.let { mediaId ->
+            if (flowNeuroObservedMediaId != mediaId) {
+                flowNeuroObservedMediaId = mediaId
+                flowNeuroObservedPositionMs = 0L
+                flowNeuroObservedDurationMs = 1L
+                flowNeuroObservedArtists = emptyList()
+                flowNeuroObservedAlbum = null
+            } else if (player.currentPosition > flowNeuroObservedPositionMs) {
+                flowNeuroObservedPositionMs = player.currentPosition
+            }
+            if (player.duration > 0 && player.duration != C.TIME_UNSET) {
+                flowNeuroObservedDurationMs = player.duration
+            }
+            player.currentMetadata?.let { metadata ->
+                flowNeuroObservedArtists = metadata.artists.map { it.name }
+                flowNeuroObservedAlbum = metadata.album?.id
+            }
         }
 
         if (events.containsAny(Player.EVENT_IS_PLAYING_CHANGED)) {
