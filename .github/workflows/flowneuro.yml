@@ -49,6 +49,7 @@ jobs:
       - name: Build APK
         run: ./gradlew --console=plain :app:assembleFossDebug --warning-mode summary
         env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
           METROLIST_APPLICATION_ID: com.metrolist.music.flowneuro
           METROLIST_APP_NAME: Metrolist FlowNeuro
           METROLIST_BUILD_COMMIT: ${{ github.sha }}
