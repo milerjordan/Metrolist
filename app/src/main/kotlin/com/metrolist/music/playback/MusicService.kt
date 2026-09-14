@@ -136,6 +136,9 @@ import com.metrolist.music.discord.DiscordTemplateRenderer
 import com.metrolist.music.discord.PresenceStatus
 import com.metrolist.music.constants.EnableLastFMScrobblingKey
 import com.metrolist.music.constants.EnableSongCacheKey
+import com.metrolist.music.constants.FlowNeuroContinuityEnabledKey
+import com.metrolist.music.constants.FlowNeuroContinuityKey
+import com.metrolist.music.constants.FlowNeuroEnabledKey
 import com.metrolist.music.constants.HideExplicitKey
 import com.metrolist.music.constants.HideVideoSongsKey
 import com.metrolist.music.constants.HistoryDuration
@@ -511,6 +514,8 @@ class MusicService :
     private var cachedShufflePlaylistFirst = false
     @Volatile
     private var cachedAutoLoadMore = true
+    @Volatile
+    private var cachedFlowNeuroDominant = true
 
     // URL cache for stream URLs - class-level so it can be invalidated on errors
     private val songUrlCache = StreamUrlCache()
@@ -1183,6 +1188,13 @@ class MusicService :
         }
         scope.launch {
             dataStore.data.map { it[AutoLoadMoreKey] ?: true }.distinctUntilChanged().collect { cachedAutoLoadMore = it }
+        }
+        scope.launch {
+            dataStore.data.map { prefs ->
+                (prefs[FlowNeuroEnabledKey] ?: true) &&
+                    (prefs[FlowNeuroContinuityEnabledKey] ?: true) &&
+                    prefs[FlowNeuroContinuityKey] == "FlowNeuro dominante"
+            }.distinctUntilChanged().collect { cachedFlowNeuroDominant = it }
         }
         if (startupPrefs!![PersistentQueueKey] ?: true) {
             val queueFile = filesDir.resolve(PERSISTENT_QUEUE_FILE)
@@ -2659,7 +2671,7 @@ class MusicService :
             }
         }
 
-        if (cachedAutoLoadMore &&
+        if (cachedAutoLoadMore && !cachedFlowNeuroDominant &&
             reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT &&
             player.mediaItemCount - player.currentMediaItemIndex <= 5 &&
             currentQueue.hasNextPage() &&
